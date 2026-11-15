@@ -1,0 +1,12 @@
+# Local user configuration & presets
+config.json
+
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e222d" />
+      <stop offset="100%" stop-color="#12141c" />
+    </linearGradient>
+    <linearGradient id="mouseGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#e6e9f0" />
+      <stop offset="100%" stop-color="#aeb6c8" />
+    </linearGradient>
+    <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#56d364" />
+      <stop offset="100%" stop-color="#8ab4f8" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded Squircle Background -->
+  <rect x="12" y="12" width="232" height="232" rx="54" ry="54" fill="url(#bgGrad)" stroke="#32394a" stroke-width="6"/>
+
+  <!-- Rapid Click Ripple Rings (Top-Left Target Hotspot) -->
+  <circle cx="96" cy="84" r="56" fill="none" stroke="url(#ringGrad)" stroke-width="5" stroke-dasharray="22 12" opacity="0.55"/>
+  <circle cx="96" cy="84" r="38" fill="none" stroke="#8ab4f8" stroke-width="6" opacity="0.85"/>
+  <circle cx="96" cy="84" r="18" fill="#56d364" opacity="0.95"/>
+
+  <!-- Gaming Mouse Body (Bottom-Right) -->
+  <g transform="translate(18, 14)">
+    <!-- Mouse Outer Shell -->
+    <rect x="86" y="76" width="84" height="126" rx="42" ry="42" fill="url(#mouseGrad)" stroke="#181a20" stroke-width="6"/>
+    <!-- Highlighted Left Mouse Button (Active Click) -->
+    <path d="M 86 118 L 86 116 A 42 42 0 0 1 128 76 L 128 122 L 86 122 Z" fill="#56d364"/>
+    <!-- Button Divider Lines -->
+    <line x1="128" y1="76" x2="128" y2="126" stroke="#181a20" stroke-width="5" stroke-linecap="round"/>
+    <line x1="88" y1="122" x2="168" y2="122" stroke="#181a20" stroke-width="5"/>
+    <!-- Scroll Wheel -->
+    <rect x="122" y="92" width="12" height="24" rx="6" ry="6" fill="#181a20"/>
+    <!-- Subtle Palm LED Accent -->
+    <path d="M 110 174 Q 128 184 146 174" fill="none" stroke="#8ab4f8" stroke-width="5" stroke-linecap="round"/>
+  </g>
+</svg>
