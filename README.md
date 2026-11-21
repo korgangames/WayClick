@@ -89,12 +89,11 @@ flowchart LR
 
 When running high-speed auto-clickers (e.g., 20–500 CPS in idle games or MMOs), switching windows or attempting to close the game can accidentally cause rapid clicks to fire across desktop icons, browser tabs, or close buttons.
 
-WayClick solves this with **Target Window Whitelisting**:
-- **Automatic Gating**: When enabled, clicks will **only** fire when an authorized target window or application class is currently focused.
-- **Auto-Pause or Stop**: If focus leaves the target window (e.g., via Alt-Tab, opening a chat overlay, or closing the game), WayClick immediately pauses clicking. As soon as you focus the window again, clicks resume smoothly.
-- **1-Click Window Binding**:
-  - Click **`⚡ Use Detected App`** to instantly whitelist the window or game you were interacting with before opening WayClick.
-  - Click **`🎯 Capture in 3s...`** and click into your game during the 3-second countdown; WayClick automatically captures the exact window title and application class (`WM_CLASS` / Wayland App ID).
+WayClick solves this with **Target Window Whitelisting & Auto-Locking**:
+- **⚡ Auto-Lock on Start (Zero Setup)**: Enabled by default. When clicking begins (after the 2s countdown or via your global hotkey), WayClick automatically locks onto whichever game/window is currently focused. Zero typing or configuration required!
+- **Auto-Pause & Resume**: If focus leaves your locked game (e.g., via Alt-Tab, opening a chat overlay, or switching monitors), WayClick immediately pauses clicking. As soon as you refocus the game, clicking resumes smoothly.
+- **Auto-Stop on Game Close**: If the target game process is closed or exits, WayClick automatically stops clicking and releases all inputs.
+- **📌 Custom Pattern Whitelist**: Optionally switch to custom whitelist mode to specify comma-separated window titles or application class substrings, with **`⚡ Use Detected App`** and **`🎯 Capture in 3s...`** helper buttons.
 - **Zero-Latency & Compositor-Native**: On KDE Plasma Wayland, tracking is powered by transient KWin 6 DBus scripting for instant focus events with zero CPU overhead, plus an automatic `xprop` fallback for other environments.
 
 ---
