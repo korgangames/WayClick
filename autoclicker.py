@@ -6,6 +6,9 @@ Designed for Linux (KDE Plasma / Wayland & XWayland / Proton Games).
 Uses Linux kernel `evdev` for global hardware hotkey detection and `uinput`
 for hardware-level virtual mouse/keyboard injection with zero external daemons.
 
+Includes real-time App/Game Window Tracking & Whitelist Locking to prevent
+unwanted auto-clicks from firing outside your designated target game or app.
+
 All configuration and game/app presets are stored strictly inside `./config.json`
 in this directory to adhere to a strict Clean System Policy.
 """
@@ -16,7 +19,9 @@ import json
 import os
 import random
 import select
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -31,7 +36,19 @@ from evdev import InputDevice, UInput, ecodes
 os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 from PyQt6.QtCore import QObject, QRectF, QSize, Qt, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QAction, QActionGroup, QColor, QCursor, QFont, QIcon, QPainter, QPen, QPixmap, QScreen
+from PyQt6.QtGui import (
+    QAction,
+    QActionGroup,
+    QColor,
+    QCursor,
+    QFont,
+    QIcon,
+    QPainter,
+    QPen,
+    QPixmap,
+    QScreen,
+)
+from PyQt6.QtDBus import QDBusConnection, QDBusInterface
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -43,6 +60,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -62,8 +80,8 @@ ICON_PNG_PATH = APP_DIR / "icon.png"
 VIRTUAL_DEVICE_NAME = "WayClick-Virtual-Input"
 
 
-def build_app_icon(active: bool = False) -> QIcon:
-    """Load the custom WayClick icon, optionally badged with a live green status dot for the system tray."""
+def build_app_icon(active: bool = False, paused: bool = False) -> QIcon:
+    """Load the custom WayClick icon, optionally badged with a live green (active) or yellow (paused) dot."""
     base_path = str(ICON_SVG_PATH if ICON_SVG_PATH.exists() else ICON_PNG_PATH)
     base_icon = QIcon(base_path)
     if not active:
@@ -75,7 +93,8 @@ def build_app_icon(active: bool = False) -> QIcon:
     painter = QPainter(pix)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setPen(QPen(QColor("#12141c"), 6.0))
-    painter.setBrush(QColor("#56d364"))
+    badge_color = QColor("#f6c177") if paused else QColor("#56d364")
+    painter.setBrush(badge_color)
     painter.drawEllipse(QRectF(82.0, 82.0, 40.0, 40.0))
     painter.end()
     return QIcon(pix)
@@ -160,6 +179,11 @@ class ClickerConfig:
     jitter_enabled: bool = False
     jitter_ms: float = 20.0           # +/- random ms added to interval
 
+    # App / Game Window Whitelist & Target Lock
+    window_lock_enabled: bool = False
+    window_whitelist: str = ""        # Comma-separated app classes or window titles
+    window_lock_mode: str = "pause"   # "pause" (suspend clicks while unfocused) or "stop"
+
     # Activation & Trigger
     hotkey_code: int = ecodes.KEY_F6
     trigger_mode: str = "toggle"      # "toggle" or "hold"
@@ -201,6 +225,7 @@ class PresetStore:
                 jitter_enabled=False,
                 hotkey_code=ecodes.KEY_F6,
                 trigger_mode="toggle",
+                window_lock_enabled=False,
             ),
             "Fast Clicker (25 CPS + Jitter)": ClickerConfig(
                 action_type="mouse",
@@ -211,6 +236,20 @@ class PresetStore:
                 jitter_ms=8.0,
                 hotkey_code=ecodes.KEY_F6,
                 trigger_mode="toggle",
+                window_lock_enabled=False,
+            ),
+            "Cell to Singularity / Idle Game (Locked)": ClickerConfig(
+                action_type="mouse",
+                mouse_button_code=ecodes.BTN_LEFT,
+                interval_ms=35.0,
+                hold_duration_ms=12.0,
+                jitter_enabled=True,
+                jitter_ms=6.0,
+                hotkey_code=ecodes.KEY_F6,
+                trigger_mode="toggle",
+                window_lock_enabled=True,
+                window_whitelist="steam_app_977400, Cell to Singularity",
+                window_lock_mode="pause",
             ),
             "Hold-to-Spam (MB4 Rapid LMB)": ClickerConfig(
                 action_type="mouse",
@@ -222,6 +261,7 @@ class PresetStore:
                 hotkey_code=ecodes.BTN_SIDE,
                 trigger_mode="hold",
                 stop_on_real_click=False,
+                window_lock_enabled=False,
             ),
             "Game Key Presser (Spacebar)": ClickerConfig(
                 action_type="keyboard",
@@ -232,6 +272,7 @@ class PresetStore:
                 jitter_ms=12.0,
                 hotkey_code=ecodes.KEY_F6,
                 trigger_mode="toggle",
+                window_lock_enabled=False,
             ),
         }
 
@@ -249,6 +290,11 @@ class PresetStore:
                     if isinstance(cfg_dict, dict):
                         loaded[str(name)] = ClickerConfig.from_dict(cfg_dict)
                 if loaded:
+                    # Provide built-in defaults for any newly added default presets
+                    defaults = self.default_presets()
+                    for def_name, def_cfg in defaults.items():
+                        if def_name not in loaded:
+                            loaded[def_name] = def_cfg
                     self.presets = loaded
                     active = str(raw.get("active_preset", ""))
                     self.active_name = active if active in self.presets else next(iter(self.presets.keys()))
@@ -278,6 +324,172 @@ class PresetStore:
     @property
     def active_config(self) -> ClickerConfig:
         return self.presets[self.active_name]
+
+
+# ---------------------------------------------------------------------------
+# Real-Time Active Window Tracker (KWin Scripting + xprop Fallback)
+# ---------------------------------------------------------------------------
+
+class ActiveWindowTracker(QObject):
+    """
+    Monitors the active/focused desktop window in real time on Linux.
+    Uses native KWin 6 scripting on KDE Wayland (zero latency, zero polling)
+    with an automatic `xprop -root -spy _NET_ACTIVE_WINDOW` fallback for other
+    desktop environments (GNOME, X11, Sway).
+    """
+
+    window_changed = pyqtSignal(str, str, int)  # (caption, resource_class, pid)
+
+    def __init__(self, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self._lock = threading.Lock()
+        self.active_caption: str = ""
+        self.active_class: str = ""
+        self.active_pid: int = 0
+        self.last_external_caption: str = ""
+        self.last_external_class: str = ""
+
+        self._script_id: int = -1
+        self._tmp_path: str = ""
+        self._fallback_stop_event = threading.Event()
+        self._fallback_thread: Optional[threading.Thread] = None
+
+        if not self._setup_kwin():
+            self._setup_fallback()
+
+    def _setup_kwin(self) -> bool:
+        try:
+            bus = QDBusConnection.sessionBus()
+            if not bus.isConnected():
+                return False
+            scripting = QDBusInterface("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", bus)
+            if not scripting.isValid():
+                return False
+
+            service_name = f"org.wayclick.Tracker_{os.getpid()}"
+            bus.registerService(service_name)
+            bus.registerObject("/Tracker", self, QDBusConnection.RegisterOption.ExportAllSlots)
+
+            script_content = f"""
+            function notify() {{
+                var win = workspace.activeWindow;
+                var caption = win ? (win.caption || '') : '';
+                var cls = win ? (win.resourceClass || '') : '';
+                var pid = win ? (win.pid || 0) : 0;
+                callDBus('{service_name}', '/Tracker', 'local.ActiveWindowTracker', 'onWindowActivated', caption, cls, pid);
+            }}
+            notify();
+            workspace.windowActivated.connect(notify);
+            """
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+                f.write(script_content)
+                self._tmp_path = f.name
+
+            plugin_name = f"wayclick_win_{os.getpid()}"
+            reply = scripting.call("loadScript", self._tmp_path, plugin_name)
+            if reply.arguments():
+                self._script_id = int(reply.arguments()[0])
+                script_obj = QDBusInterface(
+                    "org.kde.KWin",
+                    f"/Scripting/Script{self._script_id}",
+                    "org.kde.kwin.Script",
+                    bus,
+                )
+                script_obj.call("run")
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _setup_fallback(self) -> None:
+        self._fallback_thread = threading.Thread(
+            target=self._fallback_loop, daemon=True, name="WayClick-WindowFallback"
+        )
+        self._fallback_thread.start()
+
+    def _fallback_loop(self) -> None:
+        try:
+            proc = subprocess.Popen(
+                ["xprop", "-root", "-spy", "_NET_ACTIVE_WINDOW"],
+                stdout=subprocess.PIPE,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            while not self._fallback_stop_event.is_set():
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                if "window id #" in line:
+                    wid = line.strip().split()[-1]
+                    if wid and wid != "0x0":
+                        self._query_xprop_window(wid)
+            proc.terminate()
+        except Exception:
+            pass
+
+    def _query_xprop_window(self, wid: str) -> None:
+        try:
+            out = subprocess.check_output(
+                ["xprop", "-id", wid, "WM_CLASS", "_NET_WM_NAME"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=0.5,
+            )
+            classes: List[str] = []
+            name = ""
+            for line in out.splitlines():
+                if "WM_CLASS" in line and "=" in line:
+                    parts = [p.strip(' ",') for p in line.split("=", 1)[1].split(",")]
+                    classes = [p for p in parts if p]
+                elif "_NET_WM_NAME" in line and "=" in line:
+                    name = line.split("=", 1)[1].strip(' ",')
+            res_class = " / ".join(classes) if classes else ""
+            self.onWindowActivated(name, res_class, 0)
+        except Exception:
+            pass
+
+    @pyqtSlot(str, str, int)
+    def onWindowActivated(self, caption: str, resource_class: str, pid: int) -> None:
+        with self._lock:
+            self.active_caption = caption
+            self.active_class = resource_class
+            self.active_pid = pid
+            low_cls = resource_class.lower()
+            if "wayclick" not in low_cls and "autoclicker" not in low_cls and (resource_class or caption):
+                self.last_external_caption = caption
+                self.last_external_class = resource_class
+        self.window_changed.emit(caption, resource_class, pid)
+
+    def is_whitelisted(self, whitelist_str: str) -> bool:
+        """Return True if the current active window matches any comma-separated pattern in the whitelist."""
+        if not whitelist_str or not whitelist_str.strip():
+            return True
+        patterns = [p.strip().lower() for p in whitelist_str.split(",") if p.strip()]
+        if not patterns:
+            return True
+
+        with self._lock:
+            cap = self.active_caption.lower()
+            cls = self.active_class.lower()
+
+        return any(p in cap or p in cls for p in patterns)
+
+    def cleanup(self) -> None:
+        self._fallback_stop_event.set()
+        if self._script_id >= 0:
+            try:
+                bus = QDBusConnection.sessionBus()
+                scripting = QDBusInterface("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", bus)
+                plugin_name = f"wayclick_win_{os.getpid()}"
+                scripting.call("unloadScript", plugin_name)
+            except Exception:
+                pass
+            self._script_id = -1
+        if self._tmp_path and os.path.exists(self._tmp_path):
+            try:
+                os.unlink(self._tmp_path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -348,12 +560,21 @@ class ClickEngine(QObject):
     status_message = pyqtSignal(str)
     countdown_started = pyqtSignal(float)     # Countdown duration in seconds
     countdown_finished = pyqtSignal()
+    pause_state_changed = pyqtSignal(bool)    # True = paused by window lock, False = active
 
-    def __init__(self, vinput: VirtualInputDevice, config: ClickerConfig) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        vinput: VirtualInputDevice,
+        config: ClickerConfig,
+        window_tracker: Optional[ActiveWindowTracker] = None,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
         self._vinput = vinput
         self._config = config
+        self._window_tracker = window_tracker
         self._running = False
+        self._is_paused = False
         self._started_at = 0.0
         self._stopped_at = 0.0
         self._stop_event = threading.Event()
@@ -363,6 +584,10 @@ class ClickEngine(QObject):
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def is_paused(self) -> bool:
+        return self._is_paused
 
     @property
     def started_at(self) -> float:
@@ -375,6 +600,9 @@ class ClickEngine(QObject):
     def update_config(self, config: ClickerConfig) -> None:
         self._config = config
 
+    def update_window_tracker(self, tracker: ActiveWindowTracker) -> None:
+        self._window_tracker = tracker
+
     def toggle(self, from_gui: bool = False) -> None:
         if self._running:
             self.stop()
@@ -385,6 +613,7 @@ class ClickEngine(QObject):
         if self._running:
             return
         self._running = True
+        self._is_paused = False
         self._started_at = time.monotonic()
         self._stop_event.clear()
         self.state_changed.emit(True)
@@ -401,14 +630,14 @@ class ClickEngine(QObject):
             return
         self._stop_event.set()
         self._running = False
+        if self._is_paused:
+            self._is_paused = False
+            self.pause_state_changed.emit(False)
         self._stopped_at = time.monotonic()
         self.state_changed.emit(False)
 
     def _sleep_interruptible(self, seconds: float) -> bool:
-        """
-        Sleep for `seconds` with sub-millisecond precision at the tail,
-        returning True if interrupted by `_stop_event`.
-        """
+        """Sleep for `seconds` with sub-millisecond precision at tail, returning True if stopped."""
         if seconds <= 0:
             return self._stop_event.is_set()
         deadline = time.perf_counter() + seconds
@@ -431,13 +660,12 @@ class ClickEngine(QObject):
                 while time.perf_counter() < deadline and not self._stop_event.is_set():
                     time.sleep(min(0.001, max(0.0001, deadline - time.perf_counter())))
         finally:
-            # Always guarantee button/key release so inputs never get stuck
             self._vinput.send_key(target_code, 0)
 
     def _run_loop(self, from_gui: bool) -> None:
         cfg = self._config
 
-        # Optional start countdown when clicking the GUI button directly
+        # Optional start countdown when clicking GUI button directly
         if from_gui and cfg.gui_start_delay_sec > 0:
             delay = cfg.gui_start_delay_sec
             self.status_message.emit(f"Starting in {delay:.1f}s — move cursor to target...")
@@ -449,7 +677,6 @@ class ClickEngine(QObject):
                 self._stopped_at = time.monotonic()
                 self.state_changed.emit(False)
                 return
-            # Brief 15ms yield so countdown overlay unmaps before first click lands
             time.sleep(0.015)
 
         self._session_clicks = 0
@@ -458,6 +685,27 @@ class ClickEngine(QObject):
 
         while not self._stop_event.is_set():
             cfg = self._config
+
+            # --- Target Window Lock & Whitelist Gate ---
+            if self._window_tracker is not None and cfg.window_lock_enabled and cfg.window_whitelist.strip():
+                if not self._window_tracker.is_whitelisted(cfg.window_whitelist):
+                    if cfg.window_lock_mode == "stop":
+                        self.status_message.emit("Stopped: Target window lost focus (Window Lock active).")
+                        break
+                    else:  # "pause" mode
+                        if not self._is_paused:
+                            self._is_paused = True
+                            self.pause_state_changed.emit(True)
+                            self.status_message.emit("❚❚ Paused: Waiting for whitelisted window to gain focus...")
+                        if self._sleep_interruptible(0.05):
+                            break
+                        continue
+                else:
+                    if self._is_paused:
+                        self._is_paused = False
+                        self.pause_state_changed.emit(False)
+                        self.status_message.emit("Resumed: Target window focused.")
+
             target_code = (
                 cfg.mouse_button_code
                 if cfg.action_type == "mouse"
@@ -503,7 +751,7 @@ class ClickEngine(QObject):
                 self.status_message.emit(f"Completed target duration ({cfg.max_duration_sec:.1f}s).")
                 break
 
-            # Compute sleep interval until next cycle
+            # Sleep interval until next cycle
             base_interval_ms = max(1.0, cfg.interval_ms)
             if cfg.jitter_enabled and cfg.jitter_ms > 0:
                 delta = random.uniform(-cfg.jitter_ms, cfg.jitter_ms)
@@ -516,6 +764,9 @@ class ClickEngine(QObject):
                 break
 
         self._running = False
+        if self._is_paused:
+            self._is_paused = False
+            self.pause_state_changed.emit(False)
         self._stopped_at = time.monotonic()
         self.state_changed.emit(False)
 
@@ -659,10 +910,8 @@ class EvdevHotkeyMonitor(QObject):
 class ScreenCountdownCanvas(QWidget):
     """
     Stationary fullscreen translucent canvas for a single monitor during the
-    start countdown. Because the window itself stays stationary at `screen.geometry()`
-    and receives native pointer coordinates from KWin/XWayland, `mapFromGlobal(QCursor.pos())`
-    maps 1:1 with the physical cursor all the way to the extreme screen edges on
-    fractional HiDPI (1.25x) multi-monitor setups with zero lag or drift.
+    start countdown. Maps 1:1 with the physical cursor all the way to the extreme
+    screen edges on fractional HiDPI (1.25x) multi-monitor setups with zero lag or drift.
     """
 
     RING_DIAMETER = 88
@@ -685,7 +934,6 @@ class ScreenCountdownCanvas(QWidget):
         self.setGeometry(screen.geometry())
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
-        # Repaint immediately at hardware mouse polling rate
         self.update()
         super().mouseMoveEvent(event)
 
@@ -806,16 +1054,19 @@ class MainWindow(QMainWindow):
         self.store = PresetStore()
         self.config = self.store.active_config
         self.vinput = VirtualInputDevice()
-        self.engine = ClickEngine(self.vinput, self.config)
+        self.window_tracker = ActiveWindowTracker(self)
+        self.engine = ClickEngine(self.vinput, self.config, self.window_tracker, self)
         self.monitor = EvdevHotkeyMonitor(self.config)
         self.countdown_overlay = CursorCountdownController(self)
         self._syncing_speed_inputs = False
         self._loading_preset_ui = False
         self._last_real_click_stop_ts = 0.0
+        self._capture_countdown_remaining = 0
+        self._capture_timer: Optional[QTimer] = None
 
         self.setWindowTitle("WayClick — Wayland Auto Clicker & Key Presser")
         self.setWindowIcon(build_app_icon(active=False))
-        self.setMinimumWidth(540)
+        self.setMinimumWidth(560)
 
         self._apply_dark_theme()
         self._build_ui()
@@ -848,7 +1099,7 @@ class MainWindow(QMainWindow):
                 left: 12px;
                 padding: 0 6px;
             }
-            QSpinBox, QDoubleSpinBox, QComboBox {
+            QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit {
                 background-color: #12141a;
                 border: 1px solid #353a47;
                 border-radius: 5px;
@@ -856,7 +1107,7 @@ class MainWindow(QMainWindow):
                 color: #ffffff;
                 min-height: 22px;
             }
-            QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+            QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QLineEdit:focus {
                 border: 1px solid #8ab4f8;
             }
             QPushButton {
@@ -1037,8 +1288,67 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(grp_speed)
 
-        # 4. Global Hotkey & Activation Mode Group
-        grp_trigger = QGroupBox("3. Global Hotkey & Activation Mode")
+        # 4. App / Game Window Whitelist & Target Lock Group
+        grp_whitelist = QGroupBox("3. Target Window Whitelist & App Lock")
+        wl_layout = QVBoxLayout(grp_whitelist)
+        wl_layout.setSpacing(8)
+
+        self.chk_window_lock = QCheckBox("Lock auto-clicks to Whitelisted App / Window (Prevent clicking other apps)")
+        self.chk_window_lock.setToolTip(
+            "When enabled, WayClick monitors the active window and will ONLY click if the focused window\n"
+            "matches the whitelist. If you switch windows, alt-tab, or try to close the app, clicks\n"
+            "automatically pause or stop."
+        )
+        wl_layout.addWidget(self.chk_window_lock)
+
+        self.wl_container = QWidget()
+        wl_sub_layout = QGridLayout(self.wl_container)
+        wl_sub_layout.setContentsMargins(0, 2, 0, 0)
+        wl_sub_layout.setVerticalSpacing(8)
+        wl_sub_layout.setHorizontalSpacing(10)
+
+        wl_sub_layout.addWidget(QLabel("Target App/Title:"), 0, 0)
+        self.txt_whitelist = QLineEdit()
+        self.txt_whitelist.setPlaceholderText("e.g. steam_app_977400, Cell to Singularity, Stardew Valley")
+        self.txt_whitelist.setToolTip(
+            "Comma-separated list of window titles or application class names (case-insensitive substring match).\n"
+            "Example: 'steam_app_977400' or 'Cell to Singularity'."
+        )
+        wl_sub_layout.addWidget(self.txt_whitelist, 0, 1)
+
+        self.btn_use_detected = QPushButton("⚡ Use Detected App")
+        self.btn_use_detected.setToolTip("Instantly populate whitelist with the currently detected active game or app.")
+        wl_sub_layout.addWidget(self.btn_use_detected, 0, 2)
+
+        self.btn_capture_window = QPushButton("🎯 Capture in 3s...")
+        self.btn_capture_window.setToolTip(
+            "Start a 3-second countdown so you can switch to your target game window to capture its title & class."
+        )
+        wl_sub_layout.addWidget(self.btn_capture_window, 0, 3)
+
+        wl_sub_layout.addWidget(QLabel("When Unfocused:"), 1, 0)
+        self.cmb_lock_mode = QComboBox()
+        self.cmb_lock_mode.addItem("❚❚ Pause clicks (auto-resume when target re-focused)", "pause")
+        self.cmb_lock_mode.addItem("■ Stop clicker completely", "stop")
+        self.cmb_lock_mode.setToolTip(
+            "Choose whether to temporarily suspend clicks while you are on another window,\n"
+            "or stop the auto-clicker completely when the target loses focus."
+        )
+        wl_sub_layout.addWidget(self.cmb_lock_mode, 1, 1)
+
+        self.lbl_active_window = QLabel("Active Window: None")
+        self.lbl_active_window.setStyleSheet(
+            "color: #9aa0ac; font-size: 11px; background-color: #12141a; border: 1px solid #2b2f3a; "
+            "border-radius: 4px; padding: 4px 8px;"
+        )
+        self.lbl_active_window.setToolTip("Real-time active window detected on your desktop.")
+        wl_sub_layout.addWidget(self.lbl_active_window, 1, 2, 1, 2)
+
+        wl_layout.addWidget(self.wl_container)
+        root_layout.addWidget(grp_whitelist)
+
+        # 5. Global Hotkey & Activation Mode Group
+        grp_trigger = QGroupBox("4. Global Hotkey & Activation Mode")
         trigger_layout = QGridLayout(grp_trigger)
         trigger_layout.setVerticalSpacing(8)
         trigger_layout.setHorizontalSpacing(12)
@@ -1062,8 +1372,8 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(grp_trigger)
 
-        # 5. Stop Conditions & Options Group
-        grp_limits = QGroupBox("4. Stop Conditions & Window Options")
+        # 6. Stop Conditions & Options Group
+        grp_limits = QGroupBox("5. Stop Conditions & Window Options")
         limits_layout = QGridLayout(grp_limits)
         limits_layout.setVerticalSpacing(8)
         limits_layout.setHorizontalSpacing(12)
@@ -1115,7 +1425,7 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(grp_limits)
 
-        # 6. Bottom Action Button
+        # 7. Bottom Action Button
         self.btn_start_stop = QPushButton("▶  START AUTO CLICKER")
         self.btn_start_stop.setMinimumHeight(44)
         self._style_start_button(False)
@@ -1252,6 +1562,14 @@ class MainWindow(QMainWindow):
         self.spin_jitter_ms.setValue(cfg.jitter_ms)
         self.spin_jitter_ms.setEnabled(cfg.jitter_enabled)
 
+        # Window lock & whitelist
+        self.chk_window_lock.setChecked(cfg.window_lock_enabled)
+        self.txt_whitelist.setText(cfg.window_whitelist)
+        w_idx = self.cmb_lock_mode.findData(cfg.window_lock_mode)
+        if w_idx >= 0:
+            self.cmb_lock_mode.setCurrentIndex(w_idx)
+        self.wl_container.setEnabled(cfg.window_lock_enabled)
+
         self._refresh_hotkey_labels()
         t_idx = self.cmb_trigger_mode.findData(cfg.trigger_mode)
         if t_idx >= 0:
@@ -1306,6 +1624,13 @@ class MainWindow(QMainWindow):
         self.chk_jitter.toggled.connect(self._on_ui_changed)
         self.spin_jitter_ms.valueChanged.connect(self._on_ui_changed)
 
+        # Window lock & whitelist signals
+        self.chk_window_lock.toggled.connect(self._on_ui_changed)
+        self.txt_whitelist.textChanged.connect(self._on_ui_changed)
+        self.cmb_lock_mode.currentIndexChanged.connect(self._on_ui_changed)
+        self.btn_use_detected.clicked.connect(self._on_use_detected_clicked)
+        self.btn_capture_window.clicked.connect(self._on_capture_window_clicked)
+
         self.cmb_trigger_mode.currentIndexChanged.connect(self._on_ui_changed)
         self.cmb_limit_mode.currentIndexChanged.connect(self._on_ui_changed)
         self.spin_max_clicks.valueChanged.connect(self._on_ui_changed)
@@ -1325,6 +1650,10 @@ class MainWindow(QMainWindow):
         self.engine.status_message.connect(self.status_bar.showMessage, qconn)
         self.engine.countdown_started.connect(self.countdown_overlay.start_countdown, qconn)
         self.engine.countdown_finished.connect(self.countdown_overlay.stop_countdown, qconn)
+        self.engine.pause_state_changed.connect(self._on_engine_pause_state_changed, qconn)
+
+        # Window tracker signal
+        self.window_tracker.window_changed.connect(self._on_window_changed, qconn)
 
         # Hardware monitor signals (emitted from Python evdev thread -> QueuedConnection)
         self.monitor.hotkey_pressed.connect(self._on_hardware_hotkey_pressed, qconn)
@@ -1332,6 +1661,68 @@ class MainWindow(QMainWindow):
         self.monitor.emergency_stop.connect(self._on_emergency_stop, qconn)
         self.monitor.real_click_detected.connect(self._on_real_click_detected, qconn)
         self.monitor.key_captured.connect(self._on_key_captured, qconn)
+
+    # -----------------------------------------------------------------------
+    # Window Whitelist & Detection Handlers
+    # -----------------------------------------------------------------------
+
+    def _on_window_changed(self, caption: str, resource_class: str, pid: int) -> None:
+        display_text = f"Active: {resource_class or 'Unknown'}"
+        if caption:
+            short_cap = (caption[:26] + "..") if len(caption) > 28 else caption
+            display_text += f" ({short_cap})"
+        self.lbl_active_window.setText(display_text)
+
+    def _on_use_detected_clicked(self) -> None:
+        cls = self.window_tracker.last_external_class or self.window_tracker.active_class
+        cap = self.window_tracker.last_external_caption or self.window_tracker.active_caption
+        target = cls or cap
+        if target:
+            current = self.txt_whitelist.text().strip()
+            if not current:
+                self.txt_whitelist.setText(target)
+            elif target not in current:
+                self.txt_whitelist.setText(f"{current}, {target}")
+            self.chk_window_lock.setChecked(True)
+            self._on_ui_changed()
+            self.status_bar.showMessage(f"Set target whitelist to: {target}")
+        else:
+            self.status_bar.showMessage("No game/app detected yet. Switch to your game first!")
+
+    def _on_capture_window_clicked(self) -> None:
+        self._capture_countdown_remaining = 3
+        self.btn_capture_window.setEnabled(False)
+        self.btn_capture_window.setText("Capturing in 3s...")
+        self.status_bar.showMessage("Switch to your target game/app window in 3 seconds...")
+
+        self._capture_timer = QTimer(self)
+        self._capture_timer.setInterval(1000)
+        self._capture_timer.timeout.connect(self._on_capture_tick)
+        self._capture_timer.start()
+
+    def _on_capture_tick(self) -> None:
+        self._capture_countdown_remaining -= 1
+        if self._capture_countdown_remaining > 0:
+            self.btn_capture_window.setText(f"Capturing in {self._capture_countdown_remaining}s...")
+            self.status_bar.showMessage(
+                f"Switch to your target game/app window in {self._capture_countdown_remaining} seconds..."
+            )
+        else:
+            if self._capture_timer:
+                self._capture_timer.stop()
+            self.btn_capture_window.setEnabled(True)
+            self.btn_capture_window.setText("🎯 Capture in 3s...")
+
+            cls = self.window_tracker.active_class or self.window_tracker.last_external_class
+            cap = self.window_tracker.active_caption or self.window_tracker.last_external_caption
+            target = cls or cap
+            if target:
+                self.txt_whitelist.setText(target)
+                self.chk_window_lock.setChecked(True)
+                self._on_ui_changed()
+                self.status_bar.showMessage(f"Captured target window: {cls} ({cap})!")
+            else:
+                self.status_bar.showMessage("Could not detect active window.")
 
     # -----------------------------------------------------------------------
     # Preset Management Handlers
@@ -1361,7 +1752,6 @@ class MainWindow(QMainWindow):
         name = name.strip()
         if not ok or not name:
             return
-        # Clone current config into the new preset
         self.store.presets[name] = ClickerConfig.from_dict(asdict(self.config))
         self.store.active_name = name
         self.config = self.store.active_config
@@ -1474,6 +1864,7 @@ class MainWindow(QMainWindow):
         self._update_action_mode_visibility()
         self._update_limit_visibility()
         self.spin_jitter_ms.setEnabled(self.chk_jitter.isChecked())
+        self.wl_container.setEnabled(self.chk_window_lock.isChecked())
         self._update_effective_timing_label()
 
         self.config.action_type = "mouse" if self.rb_mouse.isChecked() else "keyboard"
@@ -1485,6 +1876,11 @@ class MainWindow(QMainWindow):
         self.config.hold_duration_ms = float(self.spin_hold_ms.value())
         self.config.jitter_enabled = self.chk_jitter.isChecked()
         self.config.jitter_ms = float(self.spin_jitter_ms.value())
+
+        # Window lock & whitelist settings
+        self.config.window_lock_enabled = self.chk_window_lock.isChecked()
+        self.config.window_whitelist = self.txt_whitelist.text().strip()
+        self.config.window_lock_mode = str(self.cmb_lock_mode.currentData())
 
         self.config.trigger_mode = str(self.cmb_trigger_mode.currentData())
         self.config.limit_mode = str(self.cmb_limit_mode.currentData())
@@ -1580,24 +1976,28 @@ class MainWindow(QMainWindow):
         if self.config.trigger_mode == "hold":
             self.engine.stop()
 
-    def _on_engine_state_changed(self, active: bool) -> None:
-        self._style_start_button(active)
-        self.tray_icon.setIcon(build_app_icon(active=active))
-        if active:
-            self.lbl_state.setText("● ACTIVE — RUNNING")
-            self.lbl_state.setStyleSheet("font-size: 16px; font-weight: bold; color: #56d364; border: none;")
-            self.status_banner.setStyleSheet(
-                "QFrame { background-color: #192b22; border: 1px solid #2ea043; border-radius: 8px; padding: 8px; }"
-            )
-            target_desc = (
-                format_ecode_name(self.config.mouse_button_code)
-                if self.config.action_type == "mouse"
-                else format_ecode_name(self.config.keyboard_key_code)
-            )
-            self.status_bar.showMessage(f"Active [{self.store.active_name}]: injecting {target_desc}")
-            self.tray_status_action.setText(f"● Status: ACTIVE ({self.store.active_name})")
-            self.tray_toggle_action.setText("■ Stop Auto Clicker")
-            self.tray_icon.setToolTip(f"WayClick — ACTIVE [{self.store.active_name}]")
+    def _update_banner_status(self) -> None:
+        if self.engine.is_running:
+            if self.engine.is_paused:
+                self.lbl_state.setText("❚❚ PAUSED (TARGET UNFOCUSED)")
+                self.lbl_state.setStyleSheet("font-size: 16px; font-weight: bold; color: #f6c177; border: none;")
+                self.status_banner.setStyleSheet(
+                    "QFrame { background-color: #2b2519; border: 1px solid #f6c177; border-radius: 8px; padding: 8px; }"
+                )
+                self.tray_icon.setIcon(build_app_icon(active=True, paused=True))
+                self.tray_icon.setToolTip(f"WayClick — PAUSED [{self.store.active_name}]")
+                self.tray_status_action.setText(f"❚❚ Status: PAUSED ({self.store.active_name})")
+            else:
+                locked_tag = " (LOCKED TO TARGET)" if self.config.window_lock_enabled else ""
+                self.lbl_state.setText(f"● ACTIVE — RUNNING{locked_tag}")
+                self.lbl_state.setStyleSheet("font-size: 16px; font-weight: bold; color: #56d364; border: none;")
+                self.status_banner.setStyleSheet(
+                    "QFrame { background-color: #192b22; border: 1px solid #2ea043; border-radius: 8px; padding: 8px; }"
+                )
+                self.tray_icon.setIcon(build_app_icon(active=True, paused=False))
+                self.tray_icon.setToolTip(f"WayClick — ACTIVE [{self.store.active_name}]")
+                self.tray_status_action.setText(f"● Status: ACTIVE ({self.store.active_name})")
+                self.tray_toggle_action.setText("■ Stop Auto Clicker")
         else:
             self.countdown_overlay.stop_countdown()
             self.lbl_state.setText("● IDLE (STANDBY)")
@@ -1606,9 +2006,25 @@ class MainWindow(QMainWindow):
                 "QFrame { background-color: #1f2430; border: 1px solid #32394a; border-radius: 8px; padding: 8px; }"
             )
             self.lbl_live_cps.setText("Live Rate: 0.0 / sec")
+            self.tray_icon.setIcon(build_app_icon(active=False))
             self.tray_status_action.setText(f"● Status: IDLE ({self.store.active_name})")
             self.tray_toggle_action.setText("▶ Start Auto Clicker")
             self.tray_icon.setToolTip(f"WayClick — IDLE [{self.store.active_name}]")
+
+    def _on_engine_state_changed(self, active: bool) -> None:
+        self._style_start_button(active)
+        self._update_banner_status()
+        if active:
+            target_desc = (
+                format_ecode_name(self.config.mouse_button_code)
+                if self.config.action_type == "mouse"
+                else format_ecode_name(self.config.keyboard_key_code)
+            )
+            lock_desc = f" (Locked: {self.config.window_whitelist})" if self.config.window_lock_enabled else ""
+            self.status_bar.showMessage(f"Active [{self.store.active_name}]: injecting {target_desc}{lock_desc}")
+
+    def _on_engine_pause_state_changed(self, paused: bool) -> None:
+        self._update_banner_status()
 
     def _on_stats_updated(self, total_clicks: int, inst_cps: float) -> None:
         self.lbl_clicks.setText(f"Session Actions: {total_clicks:,}")
@@ -1617,6 +2033,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.tray_icon.hide()
         self.countdown_overlay.stop_countdown()
+        self.window_tracker.cleanup()
         self.monitor.stop()
         self.engine.stop()
         time.sleep(0.05)

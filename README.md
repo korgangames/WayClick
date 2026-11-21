@@ -41,7 +41,8 @@ flowchart LR
 
     subgraph WayClick["WayClick Engine (User Space)"]
         Monitor["EvdevHotkeyMonitor\n• Global Hotkey Detection\n• Real-Click Interrupt\n• Wireless Hotplug Scanner"]
-        Engine["ClickEngine + PresetStore\n• CPS / Interval Sync\n• Humanizer Jitter\n• Frame-Accurate Hold Time"]
+        Tracker["ActiveWindowTracker\n• Zero-Latency KWin 6 DBus Scripting\n• Multi-Desktop xprop Fallback\n• Target Whitelist Locking"]
+        Engine["ClickEngine + PresetStore\n• CPS / Interval Sync\n• Window Focus Gating (Auto-Pause)\n• Humanizer Jitter\n• Frame-Accurate Hold Time"]
         VDev["VirtualInputDevice\n(/dev/uinput: WayClick-Virtual-Input)"]
     end
 
@@ -51,6 +52,8 @@ flowchart LR
 
     Mouse -->|Raw EV_KEY| Monitor
     Kbd -->|Raw EV_KEY| Monitor
+    Compositor -.->|Active Window Signals| Tracker
+    Tracker -->|Whitelist Status: Focus / Unfocus| Engine
     Monitor -->|Trigger / Stop| Engine
     Engine -->|Inject EV_KEY| VDev
     VDev -->|Hardware-Level Events| Libinput
@@ -58,8 +61,9 @@ flowchart LR
 ```
 
 1. **Global Hotkey & Real-Click Detection (`evdev`)**: WayClick reads raw hardware events directly from `/dev/input/event*`. It hears your global toggle/hold key (`F6`, mouse side buttons, etc.) inside any fullscreen game and automatically rescans when wireless mice/keyboards wake from sleep.
-2. **Hardware-Level Click & Key Injection (`uinput`)**: WayClick creates a virtual kernel device (`/dev/uinput`) named `WayClick-Virtual-Input` declaring both pointer (`EV_REL` + `EV_KEY`) and keyboard capabilities so `libinput`, Wayland compositors, and games treat every synthetic action as genuine hardware input.
-3. **100% Real-vs-Synthetic Click Separation**: Because `EvdevHotkeyMonitor` explicitly filters out `WayClick-Virtual-Input`, WayClick never hears its own synthetic clicks—meaning a single physical click on your real mouse can immediately interrupt and stop a 500 CPS auto-click stream.
+2. **App/Game Window Whitelist & Target Locking**: Detects the active window in real-time via native **KWin 6 DBus Scripting** on KDE Plasma Wayland (with automatic XWayland/X11 `xprop` fallback). When target locking is enabled, clicks are gated to fire **only** inside your chosen games or apps. If you switch windows, Alt-Tab, or close the game, auto-clicking **automatically pauses**—preventing thousands of clicks from firing across your desktop or other open applications.
+3. **Hardware-Level Click & Key Injection (`uinput`)**: WayClick creates a virtual kernel device (`/dev/uinput`) named `WayClick-Virtual-Input` declaring both pointer (`EV_REL` + `EV_KEY`) and keyboard capabilities so `libinput`, Wayland compositors, and games treat every synthetic action as genuine hardware input.
+4. **100% Real-vs-Synthetic Click Separation**: Because `EvdevHotkeyMonitor` explicitly filters out `WayClick-Virtual-Input`, WayClick never hears its own synthetic clicks—meaning a single physical click on your real mouse can immediately interrupt and stop a 500 CPS auto-click stream.
 
 ---
 
@@ -67,16 +71,31 @@ flowchart LR
 
 | Category | Feature Description |
 | :--- | :--- |
+| **🔒 App / Game Window Whitelist & Target Lock** | Restricts clicks exclusively to specified games or apps. When target window loses focus (or game closes), clicks **automatically pause** (or stop) and resume once refocused—preventing uncontrolled clicking across other open apps or desktop UI. Includes **`⚡ Use Detected App`** and **`🎯 Capture in 3s...`** buttons for 1-click binding. |
 | **🎯 Mouse & Keyboard Support** | Auto-click **Left (`LMB`)**, **Right (`RMB`)**, **Middle (`MMB`)**, **Mouse Back (`MB4`)**, or **Mouse Forward (`MB5`)** (single or double-click per cycle), or switch to **Keyboard Key Auto-Presser** and record *any* physical key. |
-| **🎮 App & Game Presets** | Create, save, rename, and switch between custom presets for different games and apps (e.g., *Stardew Valley*, *Minecraft*, *Euro Truck Simulator 2*). Includes 4 built-in starter presets. |
+| **🎮 App & Game Presets** | Create, save, rename, and switch between custom presets for different games and apps (e.g., *Cell to Singularity*, *Minecraft*, *Idle Games*). Includes 5 built-in starter presets. |
 | **🛑 Stop on Real Physical Click** | Distinguishes physical hardware clicks from synthetic `uinput` clicks—allowing any real mouse click (`LMB`/`RMB`/`MMB`) to immediately stop auto-clicking. |
 | **⭕ Zero-Drift Cursor Countdown Ring** | Clicking the GUI Start button displays a smooth 60 FPS circular countdown ring & timer badge locked 1:1 around your cursor across multi-monitor fractional HiDPI (`125%` / `150%`) setups while you move to your target window. |
 | **⚡ Synced CPS & Interval + Hold Time** | Adjust **Rate (0.05–500 CPS)** or **Interval (ms)**—both stay synchronized automatically. Configurable **Press Hold Time** (default `15 ms`, ~1 frame at 60 FPS) ensures games never miss inputs between frames. |
 | **🎲 Humanizer (Random Jitter)** | Adds randomized $\pm\text{ms}$ timing variance to both cycle intervals and button hold durations, with a live effective CPS range calculator. |
 | **⌨️ Global Hotkey: Toggle & Hold Modes** | Bind any keyboard key or mouse side button (`MB4`/`MB5`). Run in **Toggle Mode** (press once to start, again to stop) or **Hold Mode** (rapid-fire only while the button is held down). |
 | **🛡️ Anti-Trap & Panic Safeguards** | **Hardware-Verified GUI Button** ignores synthetic clicks hovering over the Start/Stop button, plus an always-active **`ESC` Emergency Stop** key and guaranteed key-release (`0`) on stop so buttons never stick. |
-| **📥 System Tray Integration** | Minimizes cleanly to the system tray with a dynamic green active-status badge, quick Start/Stop toggle, and instant Game Preset switching from the tray menu. |
+| **📥 System Tray Integration** | Minimizes cleanly to the system tray with a dynamic dual-color status badge (Green = Active, Yellow = Target Unfocused / Paused), quick Start/Stop toggle, and instant Game Preset switching from the tray menu. |
 | **🧹 Strict Clean System Policy** | Self-contained directory structure: all settings and presets save locally to `./config.json` with zero `~/.config` clutter and a 1-command clean uninstaller. |
+
+---
+
+## 🔒 Target Window Whitelist & App Locking
+
+When running high-speed auto-clickers (e.g., 20–500 CPS in idle games or MMOs), switching windows or attempting to close the game can accidentally cause rapid clicks to fire across desktop icons, browser tabs, or close buttons.
+
+WayClick solves this with **Target Window Whitelisting**:
+- **Automatic Gating**: When enabled, clicks will **only** fire when an authorized target window or application class is currently focused.
+- **Auto-Pause or Stop**: If focus leaves the target window (e.g., via Alt-Tab, opening a chat overlay, or closing the game), WayClick immediately pauses clicking. As soon as you focus the window again, clicks resume smoothly.
+- **1-Click Window Binding**:
+  - Click **`⚡ Use Detected App`** to instantly whitelist the window or game you were interacting with before opening WayClick.
+  - Click **`🎯 Capture in 3s...`** and click into your game during the 3-second countdown; WayClick automatically captures the exact window title and application class (`WM_CLASS` / Wayland App ID).
+- **Zero-Latency & Compositor-Native**: On KDE Plasma Wayland, tracking is powered by transient KWin 6 DBus scripting for instant focus events with zero CPU overhead, plus an automatic `xprop` fallback for other environments.
 
 ---
 
